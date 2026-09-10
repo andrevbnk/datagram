@@ -1,0 +1,12 @@
+{
+  "apiBaseUrl": "https://api.datagram.info/api/v1",
+  "keywordsFile": "./keywords.json",
+  "stateFile": "./state.json",
+  "resultsDir": "./results",
+  "batchSize": 10,
+  "limitPerTask": 500,
+  "intervalMinutes": 60,
+  "maxConcurrent": 1,
+  "dailyTokenBudget": 250,
+  "rateLimitPerMinute": 60
+}

@@ -1,0 +1,11 @@
+services:
+  scheduler:
+    build: .
+    container_name: datagram-scheduler
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+      - DATAGRAM_API_KEY=${DATAGRAM_API_KEY}
+    volumes:
+      - ./state.json:/app/state.json
+      - ./results:/app/results
