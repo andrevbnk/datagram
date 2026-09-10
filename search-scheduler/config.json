@@ -6,7 +6,7 @@
   "batchSize": 10,
   "limitPerTask": 500,
   "intervalMinutes": 60,
-  "maxConcurrent": 1,
-  "dailyTokenBudget": 250,
+  "maxConcurrent": 10,
+  "dailyTokenBudget": 20000,
   "rateLimitPerMinute": 60
 }

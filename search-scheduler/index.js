@@ -116,11 +116,6 @@ async function createTask(keywords) {
   return { status, body };
 }
 
-async function getTaskResults(taskId) {
-  const { status, body } = await api(`/tasks/${taskId}/results?format=json`);
-  return { status, body };
-}
-
 // ── Main run ─────────────────────────────────────────────────────────────
 async function runOnce() {
   const keywords = loadKeywords();
@@ -160,19 +155,28 @@ async function runOnce() {
 
   const { status, body } = await createTask(batch);
 
-  if (status === 201) {
-    const taskId = body.task_id;
-    log(`Task created: ${taskId} (status=${body.status})`);
+  // Real API returns 202 with { tasks: [{task_id, status}, ...] } — one task
+  // per keyword. The spec's 201/{task_id} shape is not what the live API sends.
+  const createdTasks = body?.tasks || (body?.task_id ? [body] : []);
+
+  if ((status === 201 || status === 202) && createdTasks.length > 0) {
+    log(
+      `Created ${createdTasks.length} task(s): ` +
+        createdTasks.map((t) => `${t.task_id} (${t.status})`).join(", ")
+    );
 
     state.cursor = (state.cursor + BATCH_SIZE) % keywords.length;
     state.completed += 1;
     state.lastRun = new Date().toISOString();
-    state.tasks.push({
-      taskId,
-      keywords: batch,
-      createdAt: new Date().toISOString(),
-      status: body.status,
-    });
+    for (let i = 0; i < createdTasks.length; i++) {
+      const t = createdTasks[i];
+      state.tasks.push({
+        taskId: t.task_id,
+        keyword: batch[i] ?? null,
+        createdAt: new Date().toISOString(),
+        status: t.status,
+      });
+    }
     // Keep only the last 500 task records
     if (state.tasks.length > 500) {
       state.tasks = state.tasks.slice(-500);
