@@ -29,14 +29,17 @@ search-scheduler/
 
 ```bash
 cd search-scheduler
+# 1. Создай .env с секретами (см. .env.example)
+cp .env.example .env   # и заполни ключи
 node index.js --once     # один батч и выход
-node index.js            # батч + планирование следующего запуска
+node index.js            # полный цикл: создание + опрос + автозагрузка + ТГ
 ```
 
 ### Docker
 
 ```bash
 cd search-scheduler
+# .env с DATAGRAM_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 docker compose up -d --build
 ```
 
@@ -45,12 +48,27 @@ docker compose up -d --build
 | Ключ | Описание | По умолчанию |
 |---|---|---|
 | `apiBaseUrl` | Базовый URL API | `https://api.datagram.info/api/public/v1` |
-| `apiKey` | API-ключ (`dg_live_...`) — или env `DATAGRAM_API_KEY` | — |
 | `batchSize` | Ключей на задачу (макс. 10) | `10` |
 | `limitPerTask` | Целевое число каналов на задачу (10–5000) | `500` |
-| `intervalMinutes` | Интервал между запусками | `60` |
-| `maxConcurrent` | Лимит одновременных задач (по тарифу) | `1` |
-| `dailyTokenBudget` | Дневной бюджет токенов (по тарифу) | `250` |
+| `createIntervalMinutes` | Интервал создания новых задач | `5` |
+| `pollIntervalSeconds` | Интервал опроса статуса/автозагрузки | `30` |
+| `maxConcurrent` | Лимит одновременных задач (по тарифу) | `10` |
+| `dailyTokenBudget` | Дневной бюджет токенов (по тарифу) | `20000` |
+
+Секреты (`DATAGRAM_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) задаются через `.env` или переменные окружения — **не в config.json** (он коммитится).
+
+## Автозагрузка результатов
+
+Когда задача завершается (`completed` / `partial_completed` / `completed_with_warnings`), скрипт:
+1. Скачивает результаты через `GET /tasks/{id}/results`.
+2. Сохраняет в `results/<task_id>.json`.
+3. Шлёт уведомление в Telegram с числом найденных/валидных каналов.
+
+## Telegram-уведомления
+
+Бот `@Datagram_tg_bot`. Уведомления о создании задач, завершении (с результатами) и ошибках. Настройка через `.env`:
+- `TELEGRAM_BOT_TOKEN` — токен бота
+- `TELEGRAM_CHAT_ID` — куда слать (личный chat_id или id группы/канала)
 
 ## Ограничения API Datagram (важно)
 
