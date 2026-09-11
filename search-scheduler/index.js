@@ -73,10 +73,7 @@ function loadKeywords() {
 }
 
 function loadState() {
-  if (fs.existsSync(STATE_FILE)) {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
-  }
-  return {
+  const defaults = {
     cursor: 0,
     completed: 0,
     tasks: [],
@@ -84,6 +81,11 @@ function loadState() {
     lastSessionDate: null,
     lastRun: null,
   };
+  if (fs.existsSync(STATE_FILE)) {
+    const existing = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+    return { ...defaults, ...existing };
+  }
+  return defaults;
 }
 
 function saveState(state) {
@@ -323,7 +325,9 @@ async function runSession() {
         break;
       }
 
-      // Take next unique batch
+      // Take next unique batch (snapshot state so we can roll back on failure)
+      const cursorBefore = state.cursor;
+      const usedBefore = state.usedKeywords.slice();
       const batch = takeNextBatch(state, basePool, BATCH_SIZE);
       if (batch.length === 0) {
         log("No keywords available and generation failed. Ending session.");
@@ -367,11 +371,12 @@ async function runSession() {
         await tgSend("⏹ Datagram: бюджет исчерпан (402), сессия завершена");
         break;
       } else if (status === 422 || status === 409) {
-        // Concurrent limit reached — wait and retry
+        // Concurrent limit reached — roll back cursor/used keywords and retry
+        state.cursor = cursorBefore;
+        state.usedKeywords = usedBefore;
         log(`Concurrent limit (${status}). Waiting ${POLL_INTERVAL_MS}ms...`);
         await tgSend(`⏳ Datagram: лимит одновременных задач, жду (${status})`);
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-        // Don't advance cursor — retry same batch next loop
         continue;
       } else {
         log(`Task creation failed (${status}): ${JSON.stringify(body)}`);
