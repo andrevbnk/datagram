@@ -5,8 +5,11 @@
   "resultsDir": "./results",
   "batchSize": 10,
   "limitPerTask": 500,
-  "createIntervalMinutes": 5,
+  "runHour": 13,
+  "runMinute": 0,
+  "timezone": "Europe/Berlin",
   "pollIntervalSeconds": 30,
+  "maxWaitMinutes": 20,
   "maxConcurrent": 10,
   "dailyTokenBudget": 20000,
   "rateLimitPerMinute": 60

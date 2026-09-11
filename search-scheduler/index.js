@@ -2,15 +2,17 @@
 /**
  * Datagram Search Scheduler
  *
- * Rotates through a large pool of keywords, creating Datagram search tasks on
- * a fast schedule, auto-downloading results when tasks complete, and sending
- * Telegram notifications.
+ * Once a day (default 13:00) runs a search session: creates batches of tasks
+ * until the daily token budget is exhausted, auto-downloads results, and sends
+ * Telegram notifications. Keywords are never reused; when the pool is exhausted
+ * new unique keywords are generated on the fly.
  *
  * Usage:
- *   node index.js            # run the scheduler loop (create + poll + notify)
- *   node index.js --once     # run a single create batch and exit
+ *   node index.js            # run the scheduler (waits for the daily time)
+ *   node index.js --now      # run a session immediately (for testing)
  *
  * Config lives in config.json. Keywords in keywords.json (array under "keywords").
+ * Secrets in .env (never committed).
  */
 
 import fs from "node:fs";
@@ -46,12 +48,19 @@ const API_BASE = config.apiBaseUrl.replace(/\/+$/, "");
 const API_KEY = process.env.DATAGRAM_API_KEY || config.apiKey || "";
 const BATCH_SIZE = config.batchSize; // max 10 per API
 const LIMIT_PER_TASK = config.limitPerTask;
-const CREATE_INTERVAL_MS = config.createIntervalMinutes * 60 * 1000;
-const POLL_INTERVAL_MS = config.pollIntervalSeconds * 1000;
+const RUN_HOUR = config.runHour ?? 13;
+const RUN_MINUTE = config.runMinute ?? 0;
+const TIMEZONE = config.timezone || "Europe/Berlin";
+const POLL_INTERVAL_MS = (config.pollIntervalSeconds ?? 30) * 1000;
+const MAX_WAIT_MS = (config.maxWaitMinutes ?? 20) * 60 * 1000;
 
 // Telegram
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || config.telegramBotToken || "";
 const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID || config.telegramChatId || "";
+
+// Keyword generation modifiers (used when the base pool is exhausted)
+const KW_PREFIXES = ["best", "top", "new", "free", "official", "popular", "active", "premium"];
+const KW_SUFFIXES = ["group", "community", "chat", "forum", "hub", "network", "club", "channel", "2026", "2025"];
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 function loadKeywords() {
@@ -67,7 +76,14 @@ function loadState() {
   if (fs.existsSync(STATE_FILE)) {
     return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
   }
-  return { cursor: 0, completed: 0, tasks: [], lastRun: null };
+  return {
+    cursor: 0,
+    completed: 0,
+    tasks: [],
+    usedKeywords: [],
+    lastSessionDate: null,
+    lastRun: null,
+  };
 }
 
 function saveState(state) {
@@ -82,9 +98,7 @@ function log(msg) {
 
 async function api(pathname, options = {}) {
   if (!API_KEY) {
-    throw new Error(
-      "No API key. Set DATAGRAM_API_KEY env var or apiKey in config.json."
-    );
+    throw new Error("No API key. Set DATAGRAM_API_KEY env var or apiKey in config.json.");
   }
   const url = `${API_BASE}${pathname}`;
   const res = await fetch(url, {
@@ -96,7 +110,6 @@ async function api(pathname, options = {}) {
     },
   });
 
-  // Respect Retry-After on rate limit
   if (res.status === 429) {
     const retryAfter = parseInt(res.headers.get("retry-after") || "60", 10);
     log(`Rate limited (429). Waiting ${retryAfter}s...`);
@@ -148,11 +161,7 @@ async function getAccount() {
 async function createTask(keywords) {
   const { status, body } = await api("/tasks", {
     method: "POST",
-    body: JSON.stringify({
-      keywords,
-      limit: LIMIT_PER_TASK,
-      type: "auto",
-    }),
+    body: JSON.stringify({ keywords, limit: LIMIT_PER_TASK, type: "auto" }),
   });
   return { status, body };
 }
@@ -167,178 +176,286 @@ async function getTaskResults(taskId) {
   return { status, body };
 }
 
-// ── Create batch ──────────────────────────────────────────────────────────
-async function createBatch() {
-  const keywords = loadKeywords();
-  const state = loadState();
-
-  log(
-    `Pool: ${keywords.length} keywords | cursor at ${state.cursor} | completed ${state.completed}`
-  );
-
-  // Check account limits before submitting
-  const account = await getAccount();
-  if (account) {
-    const remaining = account.daily_tokens?.remaining;
-    const limit = account.concurrent?.limit;
-    log(
-      `Account: plan=${account.plan} tokens_remaining=${remaining} concurrent_limit=${limit}`
-    );
-    if (remaining !== undefined && remaining <= 0) {
-      log("Daily token budget exhausted. Skipping this run.");
-      await tgSend("⚠️ Datagram: дневной бюджет токенов исчерпан.");
-      return;
+// ── Keyword selection (no repeats, generate when exhausted) ───────────────
+function generateNewKeywords(basePool, usedSet, count) {
+  const result = [];
+  for (const base of basePool) {
+    for (const p of KW_PREFIXES) {
+      const kw = `${p} ${base}`;
+      if (kw.length <= 100 && !usedSet.has(kw)) {
+        result.push(kw);
+        if (result.length >= count) return result;
+      }
+    }
+    for (const s of KW_SUFFIXES) {
+      const kw = `${base} ${s}`;
+      if (kw.length <= 100 && !usedSet.has(kw)) {
+        result.push(kw);
+        if (result.length >= count) return result;
+      }
     }
   }
+  return result;
+}
 
-  // Take the next batch (wrap around the pool)
+function takeNextBatch(state, basePool, count) {
+  const usedSet = new Set(state.usedKeywords);
   const batch = [];
-  for (let i = 0; i < BATCH_SIZE; i++) {
-    const idx = (state.cursor + i) % keywords.length;
-    batch.push(keywords[idx]);
+
+  // First, take from the base pool via cursor (skip already-used)
+  let attempts = 0;
+  while (batch.length < count && attempts < basePool.length) {
+    const idx = state.cursor % basePool.length;
+    const kw = basePool[idx];
+    state.cursor = (state.cursor + 1) % basePool.length;
+    attempts++;
+    if (!usedSet.has(kw)) {
+      batch.push(kw);
+      usedSet.add(kw);
+    }
   }
 
-  log(`Submitting task with ${batch.length} keywords: ${batch.join(", ")}`);
-
-  const { status, body } = await createTask(batch);
-
-  // Real API returns 202 with { tasks: [{task_id, status}, ...] } — one task
-  // per keyword. The spec's 201/{task_id} shape is not what the live API sends.
-  const createdTasks = body?.tasks || (body?.task_id ? [body] : []);
-
-  if ((status === 201 || status === 202) && createdTasks.length > 0) {
-    log(
-      `Created ${createdTasks.length} task(s): ` +
-        createdTasks.map((t) => `${t.task_id} (${t.status})`).join(", ")
-    );
-
-    state.cursor = (state.cursor + BATCH_SIZE) % keywords.length;
-    state.completed += 1;
-    state.lastRun = new Date().toISOString();
-    for (let i = 0; i < createdTasks.length; i++) {
-      const t = createdTasks[i];
-      state.tasks.push({
-        taskId: t.task_id,
-        keyword: batch[i] ?? null,
-        createdAt: new Date().toISOString(),
-        status: t.status,
-        resultsDownloaded: false,
-      });
+  // If the base pool is exhausted, generate new unique keywords
+  if (batch.length < count) {
+    const needed = count - batch.length;
+    const fresh = generateNewKeywords(basePool, usedSet, needed);
+    for (const kw of fresh) {
+      batch.push(kw);
+      usedSet.add(kw);
     }
-    // Keep only the last 2000 task records
-    if (state.tasks.length > 2000) {
-      state.tasks = state.tasks.slice(-2000);
-    }
-    saveState(state);
-
-    await tgSend(
-      `🚀 Datagram: создано ${createdTasks.length} задач\n` +
-        `Ключи: ${batch.join(", ")}`
-    );
-  } else {
-    log(`Task creation failed (${status}): ${JSON.stringify(body)}`);
-    await tgSend(`❌ Datagram: ошибка создания задач (${status}): ${JSON.stringify(body)}`);
   }
+
+  // Record used keywords
+  for (const kw of batch) {
+    if (!state.usedKeywords.includes(kw)) {
+      state.usedKeywords.push(kw);
+    }
+  }
+
+  return batch;
 }
 
-// ── Poll & download results ───────────────────────────────────────────────
-async function pollAndDownload() {
+// ── Wait for tasks to finish ──────────────────────────────────────────────
+const TERMINAL = new Set([
+  "completed",
+  "partial_completed",
+  "completed_with_warnings",
+  "failed",
+  "cancelled",
+]);
+
+async function waitForCompletion(taskIds) {
+  const start = Date.now();
+  const remaining = new Set(taskIds);
+
+  while (remaining.size > 0 && Date.now() - start < MAX_WAIT_MS) {
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    for (const id of [...remaining]) {
+      const { status, body } = await getTask(id);
+      if (status === 200 && body && TERMINAL.has(body.status)) {
+        remaining.delete(id);
+      } else if (status === 404) {
+        remaining.delete(id); // gone/expired
+      }
+    }
+    if (remaining.size > 0) {
+      log(`Waiting for ${remaining.size} task(s) to finish...`);
+    }
+  }
+  return taskIds.length - remaining.size; // how many finished
+}
+
+// ── Download results ─────────────────────────────────────────────────────
+async function downloadResults(taskIds) {
+  let downloaded = 0;
+  for (const id of taskIds) {
+    const { status, body } = await getTask(id);
+    if (status !== 200 || !body || !body.can_download) continue;
+
+    const results = await getTaskResults(id);
+    if (results.status !== 200) continue;
+
+    const items = results.body?.items || [];
+    const valid = items.filter((c) => c.is_valid).length;
+
+    fs.mkdirSync(RESULTS_DIR, { recursive: true });
+    const outFile = path.join(RESULTS_DIR, `${id}.json`);
+    fs.writeFileSync(outFile, JSON.stringify(results.body, null, 2), "utf-8");
+
+    downloaded++;
+    log(`Downloaded ${items.length} results (${valid} valid) for ${id}`);
+  }
+  return downloaded;
+}
+
+// ── Daily session ─────────────────────────────────────────────────────────
+let sessionRunning = false;
+
+async function runSession() {
+  if (sessionRunning) return;
+  sessionRunning = true;
+
   const state = loadState();
+  const basePool = loadKeywords();
 
-  // Only look at tasks that are not yet downloaded and not terminal-failed
-  const pending = state.tasks.filter(
-    (t) => !t.resultsDownloaded && t.status !== "failed" && t.status !== "cancelled"
-  );
+  log("=== Starting daily search session ===");
+  await tgSend("🚀 Datagram: старт дневной сессии поиска");
 
-  if (pending.length === 0) return;
+  let batches = 0;
+  let totalTasks = 0;
 
-  // Limit how many we poll per cycle to stay under rate limits
-  const toPoll = pending.slice(0, 20);
-
-  for (const t of toPoll) {
-    const { status, body } = await getTask(t.taskId);
-
-    if (status !== 200) {
-      // 404 = task gone/expired; mark as failed to stop polling
-      if (status === 404) {
-        t.status = "failed";
-        t.error = "not_found";
+  try {
+    while (true) {
+      // Check budget
+      const account = await getAccount();
+      if (!account) {
+        log("Could not read account; aborting session.");
+        await tgSend("❌ Datagram: не удалось прочитать аккаунт, сессия прервана");
+        break;
       }
-      continue;
-    }
 
-    t.status = body.status;
+      const remaining = account.daily_tokens?.remaining ?? 0;
+      log(`Budget: remaining=${remaining}`);
 
-    const isDone =
-      body.status === "completed" ||
-      body.status === "partial_completed" ||
-      body.status === "completed_with_warnings";
+      if (remaining <= 0) {
+        log("Daily token budget exhausted. Ending session.");
+        await tgSend("⏹ Datagram: дневной бюджет токенов исчерпан, сессия завершена");
+        break;
+      }
 
-    if (isDone && body.can_download) {
-      const results = await getTaskResults(t.taskId);
-      if (results.status === 200) {
-        const items = results.body?.items || [];
-        const valid = items.filter((c) => c.is_valid).length;
+      // Take next unique batch
+      const batch = takeNextBatch(state, basePool, BATCH_SIZE);
+      if (batch.length === 0) {
+        log("No keywords available and generation failed. Ending session.");
+        await tgSend("⚠️ Datagram: ключи исчерпаны, генерация не удалась");
+        break;
+      }
 
-        // Save to results/<taskId>.json
-        fs.mkdirSync(RESULTS_DIR, { recursive: true });
-        const outFile = path.join(RESULTS_DIR, `${t.taskId}.json`);
-        fs.writeFileSync(
-          outFile,
-          JSON.stringify(results.body, null, 2),
-          "utf-8"
-        );
+      log(`Submitting batch: ${batch.join(", ")}`);
+      const { status, body } = await createTask(batch);
 
-        t.resultsDownloaded = true;
-        t.resultsCount = items.length;
-        t.validCount = valid;
+      const createdTasks = body?.tasks || (body?.task_id ? [body] : []);
 
-        log(
-          `Downloaded ${items.length} results (${valid} valid) for ${t.taskId} (${t.keyword})`
-        );
-        await tgSend(
-          `✅ Datagram: задача "${t.keyword}" завершена\n` +
-            `Найдено: ${items.length} каналов (валидных: ${valid})`
-        );
+      if ((status === 201 || status === 202) && createdTasks.length > 0) {
+        const ids = createdTasks.map((t) => t.task_id);
+        batches++;
+        totalTasks += ids.length;
+        log(`Created ${ids.length} task(s) (batch #${batches})`);
+
+        // Record tasks in state
+        for (let i = 0; i < createdTasks.length; i++) {
+          state.tasks.push({
+            taskId: createdTasks[i].task_id,
+            keyword: batch[i] ?? null,
+            createdAt: new Date().toISOString(),
+            status: createdTasks[i].status,
+          });
+        }
+        if (state.tasks.length > 5000) state.tasks = state.tasks.slice(-5000);
+        state.completed = batches;
+        state.lastRun = new Date().toISOString();
+        saveState(state);
+
+        await tgSend(`🚀 Datagram: создано ${ids.length} задач (батч #${batches})\nКлючи: ${batch.join(", ")}`);
+
+        // Wait for completion, then download
+        const finished = await waitForCompletion(ids);
+        const downloaded = await downloadResults(ids);
+        log(`Batch #${batches}: ${finished} finished, ${downloaded} downloaded`);
+      } else if (status === 402) {
+        log("Budget exhausted (402). Ending session.");
+        await tgSend("⏹ Datagram: бюджет исчерпан (402), сессия завершена");
+        break;
+      } else if (status === 422 || status === 409) {
+        // Concurrent limit reached — wait and retry
+        log(`Concurrent limit (${status}). Waiting ${POLL_INTERVAL_MS}ms...`);
+        await tgSend(`⏳ Datagram: лимит одновременных задач, жду (${status})`);
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        // Don't advance cursor — retry same batch next loop
+        continue;
+      } else {
+        log(`Task creation failed (${status}): ${JSON.stringify(body)}`);
+        await tgSend(`❌ Datagram: ошибка создания задач (${status}): ${JSON.stringify(body)}`);
+        break;
       }
     }
+  } catch (err) {
+    log(`Session error: ${err.message}`);
+    await tgSend(`❌ Datagram: ошибка сессии: ${err.message}`);
+  } finally {
+    saveState(state);
+    sessionRunning = false;
+    log(`=== Session finished: ${batches} batches, ${totalTasks} tasks ===`);
+    await tgSend(`✅ Datagram: сессия завершена — ${batches} батчей, ${totalTasks} задач`);
   }
-
-  saveState(state);
 }
 
-// ── Main loop ─────────────────────────────────────────────────────────────
-async function main() {
-  const once = process.argv.includes("--once");
+// ── Scheduler ─────────────────────────────────────────────────────────────
+function localParts() {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = {};
+  for (const p of fmt.formatToParts(new Date())) {
+    if (p.type !== "literal") parts[p.type] = p.value;
+  }
+  return parts;
+}
 
-  if (once) {
-    await createBatch();
+function localDateString() {
+  const p = localParts();
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+function shouldRunNow() {
+  const p = localParts();
+  const hour = parseInt(p.hour, 10);
+  const minute = parseInt(p.minute, 10);
+  return hour === RUN_HOUR && minute >= RUN_MINUTE && minute < RUN_MINUTE + 5;
+}
+
+async function schedulerTick() {
+  const state = loadState();
+  const today = localDateString();
+
+  if (state.lastSessionDate === today) return; // already ran today
+
+  if (shouldRunNow()) {
+    state.lastSessionDate = today;
+    saveState(state);
+    await runSession();
+  }
+}
+
+async function main() {
+  const now = process.argv.includes("--now");
+
+  if (now) {
+    await runSession();
     return;
   }
 
-  // Run create immediately, then on interval
-  await createBatch();
-
-  // Poll loop runs more frequently than create loop
-  setInterval(async () => {
-    try {
-      await pollAndDownload();
-    } catch (err) {
-      log(`Poll error: ${err.message}`);
-    }
-  }, POLL_INTERVAL_MS);
-
-  setInterval(async () => {
-    try {
-      await createBatch();
-    } catch (err) {
-      log(`Create error: ${err.message}`);
-    }
-  }, CREATE_INTERVAL_MS);
-
   log(
-    `Scheduler running: create every ${config.createIntervalMinutes}m, poll every ${config.pollIntervalSeconds}s`
+    `Scheduler running: daily at ${RUN_HOUR}:${RUN_MINUTE} (${TIMEZONE}), batch ${BATCH_SIZE}, limit ${LIMIT_PER_TASK}`
   );
+
+  // Check every minute
+  setInterval(async () => {
+    try {
+      await schedulerTick();
+    } catch (err) {
+      log(`Scheduler error: ${err.message}`);
+    }
+  }, 60 * 1000);
+
+  // Also run an immediate tick in case we're already past the time
+  await schedulerTick();
 }
 
 main();
