@@ -1,18 +1,19 @@
 #!/usr/bin/env node
 /**
- * Datagram Search Scheduler
+ * Datagram Search Scheduler (admin API)
  *
- * Once a day (default 13:00) runs a search session: creates batches of tasks
- * until the daily token budget is exhausted, auto-downloads results, and sends
- * Telegram notifications. Keywords are never reused; when the pool is exhausted
- * new unique keywords are generated on the fly.
+ * Once a day (default 13:00) runs a search session using the Datagram ADMIN
+ * API (/api/v1/jobs) instead of the public /tasks endpoint. The public
+ * endpoint is blocked by a stuck "concurrent jobs" counter on the backend,
+ * while the admin API works fine.
+ *
+ * Auth: logs in with email/password to get a JWT (renews on expiry).
+ * Each keyword becomes one job (targetIdentifier). Results are downloaded
+ * as JSON and Telegram notifications are sent.
  *
  * Usage:
  *   node index.js            # run the scheduler (waits for the daily time)
  *   node index.js --now      # run a session immediately (for testing)
- *
- * Config lives in config.json. Keywords in keywords.json (array under "keywords").
- * Secrets in .env (never committed).
  */
 
 import fs from "node:fs";
@@ -44,15 +45,26 @@ const KEYWORDS_FILE = path.join(__dirname, config.keywordsFile);
 const STATE_FILE = path.join(__dirname, config.stateFile);
 const RESULTS_DIR = path.join(__dirname, config.resultsDir);
 
-const API_BASE = config.apiBaseUrl.replace(/\/+$/, "");
+const ADMIN_BASE = config.adminApiBaseUrl.replace(/\/+$/, "");
+const PUBLIC_BASE = config.apiBaseUrl.replace(/\/+$/, "");
+
+const EMAIL = process.env.DATAGRAM_EMAIL || "";
+const PASSWORD = process.env.DATAGRAM_PASSWORD || "";
 const API_KEY = process.env.DATAGRAM_API_KEY || config.apiKey || "";
-const BATCH_SIZE = config.batchSize; // max 10 per API
-const LIMIT_PER_TASK = config.limitPerTask;
+
+const BATCH_SIZE = config.batchSize; // max 10 concurrent jobs
+const MAX_RESULTS = config.limitPerTask;
 const RUN_HOUR = config.runHour ?? 13;
 const RUN_MINUTE = config.runMinute ?? 0;
 const TIMEZONE = config.timezone || "Europe/Berlin";
 const POLL_INTERVAL_MS = (config.pollIntervalSeconds ?? 30) * 1000;
 const MAX_WAIT_MS = (config.maxWaitMinutes ?? 20) * 60 * 1000;
+
+// Job creation params (mirrors the dashboard)
+const JOB_TYPE = 3;
+const SCRAPER_JOB_TYPE = 2;
+const SKIP_VALIDATOR = false;
+const SKIP_AI_ENRICHMENT = true;
 
 // Telegram
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || config.telegramBotToken || "";
@@ -61,6 +73,10 @@ const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID || config.telegramChatId || "";
 // Keyword generation modifiers (used when the base pool is exhausted)
 const KW_PREFIXES = ["best", "top", "new", "free", "official", "popular", "active", "premium"];
 const KW_SUFFIXES = ["group", "community", "chat", "forum", "hub", "network", "club", "channel", "2026", "2025"];
+
+// ── Auth state ────────────────────────────────────────────────────────────
+let jwt = null;
+let jwtExp = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 function loadKeywords() {
@@ -98,37 +114,79 @@ function log(msg) {
   console.log(`[${ts}] ${msg}`);
 }
 
-async function api(pathname, options = {}) {
-  if (!API_KEY) {
-    throw new Error("No API key. Set DATAGRAM_API_KEY env var or apiKey in config.json.");
+// ── Admin API auth ────────────────────────────────────────────────────────
+async function login() {
+  if (!EMAIL || !PASSWORD) {
+    throw new Error("No admin credentials. Set DATAGRAM_EMAIL and DATAGRAM_PASSWORD in .env.");
   }
-  const url = `${API_BASE}${pathname}`;
+  const res = await fetch(`${ADMIN_BASE}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (res.status !== 200) {
+    const t = await res.text();
+    throw new Error(`Login failed (${res.status}): ${t.slice(0, 200)}`);
+  }
+  const body = await res.json();
+  jwt = body.accessToken;
+  const payload = JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString());
+  jwtExp = payload.exp * 1000;
+  log(`Logged in as ${payload.email} (token expires ${new Date(jwtExp).toISOString()})`);
+}
+
+async function ensureAuth() {
+  // Renew if missing or within 5 minutes of expiry
+  if (!jwt || Date.now() > jwtExp - 5 * 60 * 1000) {
+    await login();
+  }
+}
+
+async function adminApi(pathname, options = {}) {
+  await ensureAuth();
+  const url = `${ADMIN_BASE}${pathname}`;
   const res = await fetch(url, {
     ...options,
     headers: {
-      Authorization: `Bearer ${API_KEY}`,
+      Authorization: `Bearer ${jwt}`,
       "Content-Type": "application/json",
       ...(options.headers || {}),
     },
   });
 
-  if (res.status === 429) {
-    const retryAfter = parseInt(res.headers.get("retry-after") || "60", 10);
-    log(`Rate limited (429). Waiting ${retryAfter}s...`);
-    await new Promise((r) => setTimeout(r, retryAfter * 1000));
-    return api(pathname, options);
+  // Token expired mid-session — re-login and retry once
+  if (res.status === 401) {
+    await login();
+    const retry = await fetch(url, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+        ...(options.headers || {}),
+      },
+    });
+    return retry;
   }
 
-  const text = await res.text();
-  let body = null;
-  try {
-    body = text ? JSON.parse(text) : null;
-  } catch {
-    body = text;
-  }
-  return { status: res.status, body };
+  return res;
 }
 
+// ── Public API (budget only) ──────────────────────────────────────────────
+async function getBudget() {
+  if (!API_KEY) return null;
+  try {
+    const res = await fetch(`${PUBLIC_BASE}/me`, {
+      headers: { Authorization: `Bearer ${API_KEY}` },
+    });
+    if (res.status !== 200) return null;
+    const body = await res.json();
+    return body.daily_tokens || null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Telegram ──────────────────────────────────────────────────────────────
 async function tgSend(text) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
   try {
@@ -152,30 +210,51 @@ async function tgSend(text) {
   }
 }
 
-// ── Core actions ──────────────────────────────────────────────────────────
-async function getAccount() {
-  const { status, body } = await api("/me");
-  if (status === 200) return body;
-  log(`getAccount returned ${status}: ${JSON.stringify(body)}`);
-  return null;
-}
-
-async function createTask(keywords) {
-  const { status, body } = await api("/tasks", {
+// ── Core actions (admin API) ──────────────────────────────────────────────
+async function createJob(targetIdentifier) {
+  const res = await adminApi("/jobs", {
     method: "POST",
-    body: JSON.stringify({ keywords, limit: LIMIT_PER_TASK, type: "auto" }),
+    body: JSON.stringify({
+      type: JOB_TYPE,
+      scraperJobType: SCRAPER_JOB_TYPE,
+      maxResults: MAX_RESULTS,
+      skipValidator: SKIP_VALIDATOR,
+      skipAiEnrichment: SKIP_AI_ENRICHMENT,
+      targetIdentifier,
+    }),
   });
-  return { status, body };
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  return { status: res.status, body };
 }
 
-async function getTask(taskId) {
-  const { status, body } = await api(`/tasks/${taskId}`);
-  return { status, body };
+async function getJobs() {
+  const res = await adminApi("/jobs");
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  return { status: res.status, body };
 }
 
-async function getTaskResults(taskId) {
-  const { status, body } = await api(`/tasks/${taskId}/results?format=json`);
-  return { status, body };
+async function getJobResults(jobId) {
+  const res = await adminApi(`/jobs/${jobId}/export?format=json`);
+  const text = await res.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  return { status: res.status, body };
 }
 
 // ── Keyword selection (no repeats, generate when exhausted) ───────────────
@@ -204,7 +283,6 @@ function takeNextBatch(state, basePool, count) {
   const usedSet = new Set(state.usedKeywords);
   const batch = [];
 
-  // First, take from the base pool via cursor (skip already-used)
   let attempts = 0;
   while (batch.length < count && attempts < basePool.length) {
     const idx = state.cursor % basePool.length;
@@ -217,7 +295,6 @@ function takeNextBatch(state, basePool, count) {
     }
   }
 
-  // If the base pool is exhausted, generate new unique keywords
   if (batch.length < count) {
     const needed = count - batch.length;
     const fresh = generateNewKeywords(basePool, usedSet, needed);
@@ -227,7 +304,6 @@ function takeNextBatch(state, basePool, count) {
     }
   }
 
-  // Record used keywords
   for (const kw of batch) {
     if (!state.usedKeywords.includes(kw)) {
       state.usedKeywords.push(kw);
@@ -237,55 +313,49 @@ function takeNextBatch(state, basePool, count) {
   return batch;
 }
 
-// ── Wait for tasks to finish ──────────────────────────────────────────────
-const TERMINAL = new Set([
-  "completed",
-  "partial_completed",
-  "completed_with_warnings",
-  "failed",
-  "cancelled",
-]);
+// ── Wait for jobs to finish ───────────────────────────────────────────────
+// status: 1=queued, 2=running, 3=completed, 5=cancelled
+const TERMINAL_STATUS = new Set([3, 5]);
 
-async function waitForCompletion(taskIds) {
+async function waitForCompletion(jobIds) {
   const start = Date.now();
-  const remaining = new Set(taskIds);
+  const remaining = new Set(jobIds);
 
   while (remaining.size > 0 && Date.now() - start < MAX_WAIT_MS) {
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    const { status, body } = await getJobs();
+    if (status !== 200 || !Array.isArray(body)) continue;
+
+    const byId = new Map(body.map((j) => [j.id, j]));
     for (const id of [...remaining]) {
-      const { status, body } = await getTask(id);
-      if (status === 200 && body && TERMINAL.has(body.status)) {
+      const job = byId.get(id);
+      if (!job) continue;
+      if (TERMINAL_STATUS.has(job.status)) {
         remaining.delete(id);
-      } else if (status === 404) {
-        remaining.delete(id); // gone/expired
       }
     }
     if (remaining.size > 0) {
-      log(`Waiting for ${remaining.size} task(s) to finish...`);
+      log(`Waiting for ${remaining.size} job(s) to finish...`);
     }
   }
-  return taskIds.length - remaining.size; // how many finished
+  return jobIds.length - remaining.size; // how many finished
 }
 
 // ── Download results ─────────────────────────────────────────────────────
-async function downloadResults(taskIds) {
+async function downloadResults(jobIds) {
   let downloaded = 0;
-  for (const id of taskIds) {
-    const { status, body } = await getTask(id);
-    if (status !== 200 || !body || !body.can_download) continue;
+  for (const id of jobIds) {
+    const { status, body } = await getJobResults(id);
+    if (status !== 200 || !Array.isArray(body)) continue;
 
-    const results = await getTaskResults(id);
-    if (results.status !== 200) continue;
-
-    const items = results.body?.items || [];
-    const valid = items.filter((c) => c.is_valid).length;
+    const valid = body.filter((c) => c.IsValid === true).length;
 
     fs.mkdirSync(RESULTS_DIR, { recursive: true });
     const outFile = path.join(RESULTS_DIR, `${id}.json`);
-    fs.writeFileSync(outFile, JSON.stringify(results.body, null, 2), "utf-8");
+    fs.writeFileSync(outFile, JSON.stringify(body, null, 2), "utf-8");
 
     downloaded++;
-    log(`Downloaded ${items.length} results (${valid} valid) for ${id}`);
+    log(`Downloaded ${body.length} results (${valid} valid) for ${id}`);
   }
   return downloaded;
 }
@@ -300,29 +370,27 @@ async function runSession() {
   const state = loadState();
   const basePool = loadKeywords();
 
-  log("=== Starting daily search session ===");
+  log("=== Starting daily search session (admin API) ===");
   await tgSend("🚀 Datagram: старт дневной сессии поиска");
 
   let batches = 0;
-  let totalTasks = 0;
+  let totalJobs = 0;
 
   try {
+    // Login once up front
+    await ensureAuth();
+
     while (true) {
-      // Check budget
-      const account = await getAccount();
-      if (!account) {
-        log("Could not read account; aborting session.");
-        await tgSend("❌ Datagram: не удалось прочитать аккаунт, сессия прервана");
-        break;
-      }
-
-      const remaining = account.daily_tokens?.remaining ?? 0;
-      log(`Budget: remaining=${remaining}`);
-
-      if (remaining <= 0) {
-        log("Daily token budget exhausted. Ending session.");
-        await tgSend("⏹ Datagram: дневной бюджет токенов исчерпан, сессия завершена");
-        break;
+      // Check budget (via public API — admin API doesn't expose it)
+      const budget = await getBudget();
+      if (budget) {
+        const remaining = budget.remaining ?? 0;
+        log(`Budget: remaining=${remaining}`);
+        if (remaining <= 0) {
+          log("Daily token budget exhausted. Ending session.");
+          await tgSend("⏹ Datagram: дневной бюджет токенов исчерпан, сессия завершена");
+          break;
+        }
       }
 
       // Take next unique batch (snapshot state so we can roll back on failure)
@@ -336,23 +404,44 @@ async function runSession() {
       }
 
       log(`Submitting batch: ${batch.join(", ")}`);
-      const { status, body } = await createTask(batch);
 
-      const createdTasks = body?.tasks || (body?.task_id ? [body] : []);
+      // Create one job per keyword
+      const createdJobs = [];
+      let failed = false;
+      for (const kw of batch) {
+        const { status, body } = await createJob(kw);
+        if (status === 201 && body && body.id) {
+          createdJobs.push({ id: body.id, keyword: kw });
+        } else if (status === 422 || status === 409) {
+          // Concurrent limit — stop creating, wait, retry whole batch
+          log(`Concurrent limit (${status}) on "${kw}". Stopping batch creation.`);
+          failed = true;
+          break;
+        } else if (status === 402) {
+          log("Budget exhausted (402). Ending session.");
+          await tgSend("⏹ Datagram: бюджет исчерпан (402), сессия завершена");
+          failed = true;
+          break;
+        } else {
+          log(`Job creation failed (${status}) for "${kw}": ${JSON.stringify(body)}`);
+          failed = true;
+          break;
+        }
+      }
 
-      if ((status === 201 || status === 202) && createdTasks.length > 0) {
-        const ids = createdTasks.map((t) => t.task_id);
+      if (createdJobs.length > 0) {
+        const ids = createdJobs.map((j) => j.id);
         batches++;
-        totalTasks += ids.length;
-        log(`Created ${ids.length} task(s) (batch #${batches})`);
+        totalJobs += ids.length;
+        log(`Created ${ids.length} job(s) (batch #${batches})`);
 
-        // Record tasks in state
-        for (let i = 0; i < createdTasks.length; i++) {
+        // Record jobs in state
+        for (const j of createdJobs) {
           state.tasks.push({
-            taskId: createdTasks[i].task_id,
-            keyword: batch[i] ?? null,
+            taskId: j.id,
+            keyword: j.keyword,
             createdAt: new Date().toISOString(),
-            status: createdTasks[i].status,
+            status: "queued",
           });
         }
         if (state.tasks.length > 5000) state.tasks = state.tasks.slice(-5000);
@@ -366,22 +455,16 @@ async function runSession() {
         const finished = await waitForCompletion(ids);
         const downloaded = await downloadResults(ids);
         log(`Batch #${batches}: ${finished} finished, ${downloaded} downloaded`);
-      } else if (status === 402) {
-        log("Budget exhausted (402). Ending session.");
-        await tgSend("⏹ Datagram: бюджет исчерпан (402), сессия завершена");
-        break;
-      } else if (status === 422 || status === 409) {
-        // Concurrent limit reached — roll back cursor/used keywords and retry
+      }
+
+      if (failed) {
+        // Roll back cursor/used keywords so the failed batch is retried
         state.cursor = cursorBefore;
         state.usedKeywords = usedBefore;
-        log(`Concurrent limit (${status}). Waiting ${POLL_INTERVAL_MS}ms...`);
-        await tgSend(`⏳ Datagram: лимит одновременных задач, жду (${status})`);
+        saveState(state);
+        log(`Rolled back cursor. Waiting ${POLL_INTERVAL_MS}ms before retry...`);
         await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         continue;
-      } else {
-        log(`Task creation failed (${status}): ${JSON.stringify(body)}`);
-        await tgSend(`❌ Datagram: ошибка создания задач (${status}): ${JSON.stringify(body)}`);
-        break;
       }
     }
   } catch (err) {
@@ -390,8 +473,8 @@ async function runSession() {
   } finally {
     saveState(state);
     sessionRunning = false;
-    log(`=== Session finished: ${batches} batches, ${totalTasks} tasks ===`);
-    await tgSend(`✅ Datagram: сессия завершена — ${batches} батчей, ${totalTasks} задач`);
+    log(`=== Session finished: ${batches} batches, ${totalJobs} jobs ===`);
+    await tgSend(`✅ Datagram: сессия завершена — ${batches} батчей, ${totalJobs} задач`);
   }
 }
 
@@ -447,10 +530,9 @@ async function main() {
   }
 
   log(
-    `Scheduler running: daily at ${RUN_HOUR}:${RUN_MINUTE} (${TIMEZONE}), batch ${BATCH_SIZE}, limit ${LIMIT_PER_TASK}`
+    `Scheduler running: daily at ${RUN_HOUR}:${RUN_MINUTE} (${TIMEZONE}), batch ${BATCH_SIZE}, maxResults ${MAX_RESULTS}`
   );
 
-  // Check every minute
   setInterval(async () => {
     try {
       await schedulerTick();
@@ -459,7 +541,6 @@ async function main() {
     }
   }, 60 * 1000);
 
-  // Also run an immediate tick in case we're already past the time
   await schedulerTick();
 }
 

@@ -6,6 +6,8 @@ services:
     environment:
       - TZ=Europe/Berlin
       - DATAGRAM_API_KEY=${DATAGRAM_API_KEY}
+      - DATAGRAM_EMAIL=${DATAGRAM_EMAIL}
+      - DATAGRAM_PASSWORD=${DATAGRAM_PASSWORD}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     volumes:

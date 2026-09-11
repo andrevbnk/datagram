@@ -1,5 +1,6 @@
 {
   "apiBaseUrl": "https://api.datagram.info/api/public/v1",
+  "adminApiBaseUrl": "https://api.datagram.info/api/v1",
   "keywordsFile": "./keywords.json",
   "stateFile": "./state.json",
   "resultsDir": "./results",
