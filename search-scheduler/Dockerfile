@@ -9,6 +9,7 @@ RUN apk add --no-cache tzdata
 # Copy only what's needed
 COPY package.json ./
 COPY index.js ./
+COPY bot.js ./
 COPY config.json ./
 COPY keywords.json ./
 COPY crontab ./

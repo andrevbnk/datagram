@@ -13,3 +13,17 @@ services:
     volumes:
       - ./state.json:/app/state.json
       - ./results:/app/results
+
+  bot:
+    build: .
+    container_name: datagram-bot
+    restart: unless-stopped
+    entrypoint: ["node", "bot.js"]
+    environment:
+      - TZ=Europe/Berlin
+      - DATAGRAM_API_KEY=${DATAGRAM_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    volumes:
+      - ./state.json:/app/state.json
+      - ./results:/app/results
