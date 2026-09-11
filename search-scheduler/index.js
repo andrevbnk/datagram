@@ -161,7 +161,7 @@ async function getAccount() {
 async function createTask(keywords) {
   const { status, body } = await api("/tasks", {
     method: "POST",
-    body: JSON.stringify({ keywords, limit: LIMIT_PER_TASK, type: 3 }),
+    body: JSON.stringify({ keywords, limit: LIMIT_PER_TASK, type: "auto" }),
   });
   return { status, body };
 }
