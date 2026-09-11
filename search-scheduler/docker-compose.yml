@@ -4,7 +4,7 @@ services:
     container_name: datagram-scheduler
     restart: unless-stopped
     environment:
-      - TZ=UTC
+      - TZ=Europe/Berlin
       - DATAGRAM_API_KEY=${DATAGRAM_API_KEY}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}

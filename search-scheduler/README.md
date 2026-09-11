@@ -45,6 +45,8 @@ cd search-scheduler
 docker compose up -d --build
 ```
 
+Контейнер запускает `crond`, который ежедневно в **13:00 (Europe/Berlin)** выполняет `node index.js --now`. Логи — `/var/log/scheduler.log` внутри контейнера (`docker compose logs scheduler`).
+
 ## Настройки (config.json)
 
 | Ключ | Описание | По умолчанию |
