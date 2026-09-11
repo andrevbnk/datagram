@@ -6,6 +6,8 @@ services:
     environment:
       - TZ=UTC
       - DATAGRAM_API_KEY=${DATAGRAM_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     volumes:
       - ./state.json:/app/state.json
       - ./results:/app/results

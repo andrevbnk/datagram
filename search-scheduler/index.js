@@ -2,14 +2,13 @@
 /**
  * Datagram Search Scheduler
  *
- * Rotates through a large pool of keywords, creating (and re-creating)
- * Datagram search tasks on a schedule. Each run takes the next batch of
- * keywords from the pool, submits a task, and records progress in state.json
- * so the next run continues where the last one left off.
+ * Rotates through a large pool of keywords, creating Datagram search tasks on
+ * a fast schedule, auto-downloading results when tasks complete, and sending
+ * Telegram notifications.
  *
  * Usage:
- *   node index.js            # run once, then schedule the next run
- *   node index.js --once     # run a single batch and exit (no re-schedule)
+ *   node index.js            # run the scheduler loop (create + poll + notify)
+ *   node index.js --once     # run a single create batch and exit
  *
  * Config lives in config.json. Keywords in keywords.json (array under "keywords").
  */
@@ -19,6 +18,20 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Load .env (secrets) if present — never committed
+function loadEnv() {
+  const envFile = path.join(__dirname, ".env");
+  if (!fs.existsSync(envFile)) return;
+  const lines = fs.readFileSync(envFile, "utf-8").split(/\r?\n/);
+  for (const line of lines) {
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+    if (m && !(m[1] in process.env)) {
+      process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+    }
+  }
+}
+loadEnv();
 
 // ── Config ────────────────────────────────────────────────────────────────
 const config = JSON.parse(
@@ -33,7 +46,12 @@ const API_BASE = config.apiBaseUrl.replace(/\/+$/, "");
 const API_KEY = process.env.DATAGRAM_API_KEY || config.apiKey || "";
 const BATCH_SIZE = config.batchSize; // max 10 per API
 const LIMIT_PER_TASK = config.limitPerTask;
-const INTERVAL_MS = config.intervalMinutes * 60 * 1000;
+const CREATE_INTERVAL_MS = config.createIntervalMinutes * 60 * 1000;
+const POLL_INTERVAL_MS = config.pollIntervalSeconds * 1000;
+
+// Telegram
+const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || config.telegramBotToken || "";
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID || config.telegramChatId || "";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 function loadKeywords() {
@@ -96,6 +114,29 @@ async function api(pathname, options = {}) {
   return { status: res.status, body };
 }
 
+async function tgSend(text) {
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+  try {
+    const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      log(`Telegram send failed: ${res.status} ${err}`);
+    }
+  } catch (e) {
+    log(`Telegram send error: ${e.message}`);
+  }
+}
+
 // ── Core actions ──────────────────────────────────────────────────────────
 async function getAccount() {
   const { status, body } = await api("/me");
@@ -116,8 +157,18 @@ async function createTask(keywords) {
   return { status, body };
 }
 
-// ── Main run ─────────────────────────────────────────────────────────────
-async function runOnce() {
+async function getTask(taskId) {
+  const { status, body } = await api(`/tasks/${taskId}`);
+  return { status, body };
+}
+
+async function getTaskResults(taskId) {
+  const { status, body } = await api(`/tasks/${taskId}/results?format=json`);
+  return { status, body };
+}
+
+// ── Create batch ──────────────────────────────────────────────────────────
+async function createBatch() {
   const keywords = loadKeywords();
   const state = loadState();
 
@@ -129,17 +180,13 @@ async function runOnce() {
   const account = await getAccount();
   if (account) {
     const remaining = account.daily_tokens?.remaining;
-    const active = account.concurrent?.active;
     const limit = account.concurrent?.limit;
     log(
-      `Account: plan=${account.plan} tokens_remaining=${remaining} concurrent=${active}/${limit}`
+      `Account: plan=${account.plan} tokens_remaining=${remaining} concurrent_limit=${limit}`
     );
     if (remaining !== undefined && remaining <= 0) {
       log("Daily token budget exhausted. Skipping this run.");
-      return;
-    }
-    if (active !== undefined && limit !== undefined && active >= limit) {
-      log("Concurrent task limit reached. Skipping this run.");
+      await tgSend("⚠️ Datagram: дневной бюджет токенов исчерпан.");
       return;
     }
   }
@@ -175,33 +222,123 @@ async function runOnce() {
         keyword: batch[i] ?? null,
         createdAt: new Date().toISOString(),
         status: t.status,
+        resultsDownloaded: false,
       });
     }
-    // Keep only the last 500 task records
-    if (state.tasks.length > 500) {
-      state.tasks = state.tasks.slice(-500);
+    // Keep only the last 2000 task records
+    if (state.tasks.length > 2000) {
+      state.tasks = state.tasks.slice(-2000);
     }
     saveState(state);
-  } else {
-    log(
-      `Task creation failed (${status}): ${JSON.stringify(body)}`
+
+    await tgSend(
+      `🚀 Datagram: создано ${createdTasks.length} задач\n` +
+        `Ключи: ${batch.join(", ")}`
     );
+  } else {
+    log(`Task creation failed (${status}): ${JSON.stringify(body)}`);
+    await tgSend(`❌ Datagram: ошибка создания задач (${status}): ${JSON.stringify(body)}`);
   }
 }
 
+// ── Poll & download results ───────────────────────────────────────────────
+async function pollAndDownload() {
+  const state = loadState();
+
+  // Only look at tasks that are not yet downloaded and not terminal-failed
+  const pending = state.tasks.filter(
+    (t) => !t.resultsDownloaded && t.status !== "failed" && t.status !== "cancelled"
+  );
+
+  if (pending.length === 0) return;
+
+  // Limit how many we poll per cycle to stay under rate limits
+  const toPoll = pending.slice(0, 20);
+
+  for (const t of toPoll) {
+    const { status, body } = await getTask(t.taskId);
+
+    if (status !== 200) {
+      // 404 = task gone/expired; mark as failed to stop polling
+      if (status === 404) {
+        t.status = "failed";
+        t.error = "not_found";
+      }
+      continue;
+    }
+
+    t.status = body.status;
+
+    const isDone =
+      body.status === "completed" ||
+      body.status === "partial_completed" ||
+      body.status === "completed_with_warnings";
+
+    if (isDone && body.can_download) {
+      const results = await getTaskResults(t.taskId);
+      if (results.status === 200) {
+        const items = results.body?.items || [];
+        const valid = items.filter((c) => c.is_valid).length;
+
+        // Save to results/<taskId>.json
+        fs.mkdirSync(RESULTS_DIR, { recursive: true });
+        const outFile = path.join(RESULTS_DIR, `${t.taskId}.json`);
+        fs.writeFileSync(
+          outFile,
+          JSON.stringify(results.body, null, 2),
+          "utf-8"
+        );
+
+        t.resultsDownloaded = true;
+        t.resultsCount = items.length;
+        t.validCount = valid;
+
+        log(
+          `Downloaded ${items.length} results (${valid} valid) for ${t.taskId} (${t.keyword})`
+        );
+        await tgSend(
+          `✅ Datagram: задача "${t.keyword}" завершена\n` +
+            `Найдено: ${items.length} каналов (валидных: ${valid})`
+        );
+      }
+    }
+  }
+
+  saveState(state);
+}
+
+// ── Main loop ─────────────────────────────────────────────────────────────
 async function main() {
   const once = process.argv.includes("--once");
 
-  try {
-    await runOnce();
-  } catch (err) {
-    log(`Error: ${err.message}`);
+  if (once) {
+    await createBatch();
+    return;
   }
 
-  if (!once) {
-    log(`Next run in ${config.intervalMinutes} minutes.`);
-    setTimeout(main, INTERVAL_MS);
-  }
+  // Run create immediately, then on interval
+  await createBatch();
+
+  // Poll loop runs more frequently than create loop
+  setInterval(async () => {
+    try {
+      await pollAndDownload();
+    } catch (err) {
+      log(`Poll error: ${err.message}`);
+    }
+  }, POLL_INTERVAL_MS);
+
+  setInterval(async () => {
+    try {
+      await createBatch();
+    } catch (err) {
+      log(`Create error: ${err.message}`);
+    }
+  }, CREATE_INTERVAL_MS);
+
+  log(
+    `Scheduler running: create every ${config.createIntervalMinutes}m, poll every ${config.pollIntervalSeconds}s`
+  );
 }
 
 main();
