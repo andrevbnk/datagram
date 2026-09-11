@@ -1,0 +1,13 @@
+{
+  "apiBaseUrl": "https://api.datagram.info/api/public/v1",
+  "keywordsFile": "./keywords.json",
+  "stateFile": "./state.json",
+  "resultsDir": "./results",
+  "batchSize": 10,
+  "limitPerTask": 500,
+  "createIntervalMinutes": 5,
+  "pollIntervalSeconds": 30,
+  "maxConcurrent": 10,
+  "dailyTokenBudget": 20000,
+  "rateLimitPerMinute": 60
+}
