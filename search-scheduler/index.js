@@ -145,19 +145,9 @@ async function ensureAuth() {
 async function adminApi(pathname, options = {}) {
   await ensureAuth();
   const url = `${ADMIN_BASE}${pathname}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${jwt}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-  });
 
-  // Token expired mid-session — re-login and retry once
-  if (res.status === 401) {
-    await login();
-    const retry = await fetch(url, {
+  const attempt = async () =>
+    fetch(url, {
       ...options,
       headers: {
         Authorization: `Bearer ${jwt}`,
@@ -165,7 +155,31 @@ async function adminApi(pathname, options = {}) {
         ...(options.headers || {}),
       },
     });
-    return retry;
+
+  let res;
+  let lastErr;
+  // Retry transient network failures (fetch failed) up to 3 times
+  for (let i = 0; i < 3; i++) {
+    try {
+      res = await attempt();
+      break;
+    } catch (e) {
+      lastErr = e;
+      log(`Network error (attempt ${i + 1}/3): ${e.message}. Retrying in 5s...`);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+  if (!res) throw lastErr;
+
+  // Token expired mid-session — re-login and retry once
+  if (res.status === 401) {
+    await login();
+    try {
+      return await attempt();
+    } catch (e) {
+      log(`Network error after re-login: ${e.message}`);
+      throw e;
+    }
   }
 
   return res;
