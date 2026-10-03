@@ -1,0 +1,15 @@
+{
+  "name": "datagram-search-scheduler",
+  "version": "1.0.0",
+  "description": "Rotating scheduler that creates/recreates Datagram search tasks from a keyword pool",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "run-once": "node index.js --once"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}

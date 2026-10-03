@@ -1,0 +1,2 @@
+# Daily search session at 13:00 (container TZ = Europe/Berlin)
+0 13 * * * cd /app && node index.js --now >> /var/log/scheduler.log 2>&1
