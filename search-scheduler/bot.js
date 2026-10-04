@@ -13,6 +13,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -85,7 +86,12 @@ async function sendMessage(text, keyboard) {
 
 function statsKeyboard() {
   return {
-    inline_keyboard: [[{ text: "📊 Статистика", callback_data: "stats" }]],
+    inline_keyboard: [
+      [
+        { text: "📊 Статистика", callback_data: "stats" },
+        { text: "🚀 Запустить", callback_data: "run" },
+      ],
+    ],
   };
 }
 
@@ -131,11 +137,15 @@ function loadStats() {
 }
 
 // Count unique valid channels in the JSONL store (dedup by username).
+// Also computes resource-type breakdown and subscriber aggregates.
 function scanValidChannels() {
   let total = 0;
-  const subscribers = { count: 0, sum: 0 };
+  const byType = { channel: 0, group: 0, chat: 0, unknown: 0 };
+  const subscribers = { count: 0, sum: 0, max: 0 };
+  const topChannels = []; // { username, title, subscribers }
+
   if (!fs.existsSync(VALID_CHANNELS_FILE)) {
-    return { total, subscribers };
+    return { total, byType, subscribers, topChannels };
   }
   const text = fs.readFileSync(VALID_CHANNELS_FILE, "utf-8");
   for (const line of text.split(/\r?\n/)) {
@@ -143,16 +153,35 @@ function scanValidChannels() {
     try {
       const rec = JSON.parse(line);
       total++;
+      const rt = String(rec.ResourceType || "unknown").toLowerCase();
+      byType[byType[rt] !== undefined ? rt : "unknown"]++;
+
       const sc = Number(rec.SubscriberCount);
       if (Number.isFinite(sc) && sc > 0) {
         subscribers.count++;
         subscribers.sum += sc;
+        if (sc > subscribers.max) subscribers.max = sc;
       }
+      topChannels.push({
+        username: rec.username,
+        title: rec.Title,
+        subscribers: sc,
+      });
     } catch {
       // skip malformed
     }
   }
-  return { total, subscribers };
+
+  // Sort by subscribers desc (unknown/0 go last), keep top 5
+  topChannels.sort(
+    (a, b) => (b.subscribers || 0) - (a.subscribers || 0)
+  );
+  return {
+    total,
+    byType,
+    subscribers,
+    topChannels: topChannels.slice(0, 5),
+  };
 }
 
 async function getBudget() {
@@ -183,29 +212,46 @@ async function buildStatsText() {
   lines.push("<b>📊 Datagram — статистика</b>");
   lines.push("");
   if (budget) {
+    const pct = budget.limit ? Math.round((budget.used_today / budget.limit) * 100) : 0;
     lines.push(
-      `💰 Токены: <b>${fmt(budget.remaining)}</b> / ${fmt(budget.limit)} (использовано ${fmt(budget.used_today)})`
+      `💰 Токены: <b>${fmt(budget.remaining)}</b> / ${fmt(budget.limit)} (использовано ${fmt(budget.used_today)}, ${pct}%)`
     );
   }
+  lines.push("");
   lines.push(`🛠 Задач создано: <b>${fmt(stats.totalJobs)}</b>`);
   lines.push(`🔑 Ключей использовано: <b>${fmt(state.usedKeywords.length)}</b>`);
   lines.push(`📍 Курсор пула: <b>${fmt(state.cursor)}</b>`);
   lines.push(`✅ Сессий: <b>${fmt(stats.sessions)}</b>`);
+  if (state.running) {
+    lines.push(`🟢 Сейчас выполняется: <b>да</b>`);
+  }
   lines.push("");
-  lines.push(`📁 Всего записей (за всё время): <b>${fmt(stats.totalResults)}</b>`);
-  lines.push(`✔️ Валидных (за всё время): <b>${fmt(stats.totalValid)}</b>`);
+  lines.push(`📁 Всего записей: <b>${fmt(stats.totalResults)}</b>`);
+  lines.push(`✔️ Валидных (всего): <b>${fmt(stats.totalValid)}</b>`);
+  lines.push(`⭐ Уникальных валидных: <b>${fmt(valid.total)}</b>`);
+  lines.push("");
   lines.push(
-    `📺 Каналов: <b>${fmt(stats.totalChannels)}</b> · 👥 Чатов: <b>${fmt(stats.totalChats)}</b>`
+    `📺 Каналов: <b>${fmt(valid.byType.channel)}</b> · 👥 Групп: <b>${fmt(valid.byType.group)}</b> · 💬 Чатов: <b>${fmt(valid.byType.chat)}</b>`
   );
-  lines.push(`⭐ Уникальных валидных каналов: <b>${fmt(valid.total)}</b>`);
   if (valid.subscribers.count > 0) {
     const avg = Math.round(valid.subscribers.sum / valid.subscribers.count);
     lines.push(
-      `📈 Подписчики: среднее <b>${fmt(avg)}</b> (по ${fmt(valid.subscribers.count)} каналам)`
+      `📈 Подписчики: среднее <b>${fmt(avg)}</b> · максимум <b>${fmt(valid.subscribers.max)}</b>`
     );
   }
-  if (stats.lastRun) {
+  if (valid.topChannels.length > 0) {
     lines.push("");
+    lines.push("<b>🏆 Топ каналов:</b>");
+    for (const c of valid.topChannels) {
+      const t = (c.title || c.username || "").toString().slice(0, 30);
+      lines.push(`• ${fmt(c.subscribers)} — ${t}`);
+    }
+  }
+  if (stats.firstRun) {
+    lines.push("");
+    lines.push(`🕐 Первый запуск: ${stats.firstRun}`);
+  }
+  if (stats.lastRun) {
     lines.push(`🕐 Последний запуск: ${stats.lastRun}`);
   }
   return lines.join("\n");
@@ -217,6 +263,45 @@ async function handleStats(chatId) {
   await sendMessage(text, statsKeyboard());
 }
 
+// Manual run: spawns `node index.js --now` as a detached child in this same
+// container (shares the mounted volumes). The cross-process lock in index.js
+// (state.running) prevents overlap with cron.
+let runChild = null;
+
+async function handleRun(chatId) {
+  const state = loadState();
+  if (state.running) {
+    await sendMessage("⏳ Сессия уже выполняется — повторный запуск пропущен.", statsKeyboard());
+    return;
+  }
+  if (runChild && runChild.exitCode === null) {
+    await sendMessage("⏳ Запуск уже инициирован, сессия стартует.", statsKeyboard());
+    return;
+  }
+
+  await sendMessage("🚀 Запускаю сессию поиска вручную...", statsKeyboard());
+
+  try {
+    runChild = spawn("node", ["index.js", "--now"], {
+      cwd: __dirname,
+      detached: true,
+      stdio: "ignore",
+    });
+    runChild.unref();
+
+    // Notify when it exits (best-effort, via polling child exit)
+    runChild.on("exit", (code) => {
+      log(`Manual run child exited with code ${code}`);
+    });
+    runChild.on("error", (err) => {
+      log(`Manual run spawn error: ${err.message}`);
+    });
+  } catch (e) {
+    log(`Manual run failed: ${e.message}`);
+    await sendMessage(`❌ Не удалось запустить: ${e.message}`, statsKeyboard());
+  }
+}
+
 // ── Update loop ───────────────────────────────────────────────────────────
 async function processUpdate(upd) {
   // Callback query (inline button)
@@ -226,8 +311,10 @@ async function processUpdate(upd) {
     if (chatId && String(chatId) === ALLOWED_CHAT_ID) {
       if (cb.data === "stats") {
         await handleStats(chatId);
-        await tg("answerCallbackQuery", { callback_query_id: cb.id });
+      } else if (cb.data === "run") {
+        await handleRun(chatId);
       }
+      await tg("answerCallbackQuery", { callback_query_id: cb.id });
     }
     return;
   }
@@ -249,6 +336,8 @@ async function processUpdate(upd) {
     );
   } else if (text === "/stats" || text === "📊 Статистика") {
     await handleStats(chatId);
+  } else if (text === "/run" || text === "🚀 Запустить") {
+    await handleRun(chatId);
   }
 }
 

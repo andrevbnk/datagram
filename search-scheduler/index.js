@@ -98,6 +98,7 @@ function loadState() {
     usedKeywords: [],
     lastSessionDate: null,
     lastRun: null,
+    running: false,
   };
   if (fs.existsSync(STATE_FILE)) {
     const existing = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
@@ -484,6 +485,17 @@ async function runSession() {
   sessionRunning = true;
 
   const state = loadState();
+
+  // Cross-process lock via shared state.json: prevents cron and a manual
+  // bot-triggered run from overlapping.
+  if (state.running) {
+    log("Another session is already running (state.running=true). Skipping.");
+    sessionRunning = false;
+    return;
+  }
+  state.running = true;
+  saveState(state);
+
   const basePool = loadKeywords();
   const stats = loadStats();
   const knownUsernames = loadKnownUsernames();
@@ -625,6 +637,7 @@ async function runSession() {
     log(`Session error: ${err.message}`);
     await tgSend(`❌ Datagram: ошибка сессии: ${err.message}`);
   } finally {
+    state.running = false;
     saveState(state);
     saveStats(stats);
     sessionRunning = false;
