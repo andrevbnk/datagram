@@ -44,6 +44,8 @@ const config = JSON.parse(
 const KEYWORDS_FILE = path.join(__dirname, config.keywordsFile);
 const STATE_FILE = path.join(__dirname, config.stateFile);
 const RESULTS_DIR = path.join(__dirname, config.resultsDir);
+const STATS_FILE = path.join(__dirname, "stats.json");
+const VALID_CHANNELS_FILE = path.join(__dirname, config.validChannelsFile || "./valid-channels.jsonl");
 
 const ADMIN_BASE = config.adminApiBaseUrl.replace(/\/+$/, "");
 const PUBLIC_BASE = config.apiBaseUrl.replace(/\/+$/, "");
@@ -107,6 +109,104 @@ function loadState() {
 function saveState(state) {
   fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+}
+
+// ── Cumulative stats (persisted across sessions) ─────────────────────────
+function loadStats() {
+  const defaults = {
+    totalJobs: 0,
+    totalResults: 0,
+    totalValid: 0,
+    totalChannels: 0,
+    totalChats: 0,
+    totalUniqueUsernames: 0,
+    uniqueUsernames: [], // bounded set of valid usernames seen so far
+    sessions: 0,
+    batches: [], // per-batch records (bounded)
+    firstRun: null,
+    lastRun: null,
+  };
+  if (fs.existsSync(STATS_FILE)) {
+    try {
+      return { ...defaults, ...JSON.parse(fs.readFileSync(STATS_FILE, "utf-8")) };
+    } catch {
+      return defaults;
+    }
+  }
+  return defaults;
+}
+
+function saveStats(stats) {
+  fs.mkdirSync(path.dirname(STATS_FILE), { recursive: true });
+  fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2), "utf-8");
+}
+
+// ── Cumulative valid-channel store (JSONL, append-only, dedup by username) ─
+// Loads the set of usernames already saved so we don't re-append duplicates.
+function loadKnownUsernames() {
+  const seen = new Set();
+  if (!fs.existsSync(VALID_CHANNELS_FILE)) return seen;
+  const text = fs.readFileSync(VALID_CHANNELS_FILE, "utf-8");
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const rec = JSON.parse(line);
+      if (rec && rec.username) seen.add(rec.username);
+    } catch {
+      // skip malformed line
+    }
+  }
+  return seen;
+}
+
+// Append valid channel records to the JSONL file, skipping duplicates.
+// Returns the number of newly appended records.
+function appendValidChannels(validItems, knownSet) {
+  if (!validItems || validItems.length === 0) return 0;
+  let appended = 0;
+  const lines = [];
+  for (const c of validItems) {
+    const u = c && c.username;
+    if (!u || knownSet.has(u)) continue;
+    knownSet.add(u);
+    lines.push(JSON.stringify(c));
+    appended++;
+  }
+  if (lines.length > 0) {
+    fs.mkdirSync(path.dirname(VALID_CHANNELS_FILE), { recursive: true });
+    fs.appendFileSync(VALID_CHANNELS_FILE, lines.join("\n") + "\n", "utf-8");
+  }
+  return appended;
+}
+
+// Merge a batch's downloaded results into cumulative stats.
+// batchResults: array of result-item objects (already flattened).
+function accumulateStats(stats, batchResults) {
+  let results = 0;
+  let valid = 0;
+  let channels = 0;
+  let chats = 0;
+  const seen = new Set(stats.uniqueUsernames || []);
+
+  for (const c of batchResults) {
+    if (!c || typeof c !== "object") continue;
+    results++;
+    if (c.IsValid !== true) continue;
+    valid++;
+    const rt = c.ResourceType;
+    if (rt === "channel") channels++;
+    else if (rt === "chat") chats++;
+    const u = c.username;
+    if (u && !seen.has(u)) seen.add(u);
+  }
+
+  stats.totalResults += results;
+  stats.totalValid += valid;
+  stats.totalChannels += channels;
+  stats.totalChats += chats;
+  stats.totalUniqueUsernames = seen.size;
+  stats.uniqueUsernames = [...seen].slice(-50000); // bounded
+  return { results, valid, channels, chats };
 }
 
 function log(msg) {
@@ -358,6 +458,7 @@ async function waitForCompletion(jobIds) {
 // ── Download results ─────────────────────────────────────────────────────
 async function downloadResults(jobIds) {
   let downloaded = 0;
+  const allResults = [];
   for (const id of jobIds) {
     const { status, body } = await getJobResults(id);
     if (status !== 200 || !Array.isArray(body)) continue;
@@ -369,9 +470,10 @@ async function downloadResults(jobIds) {
     fs.writeFileSync(outFile, JSON.stringify(body, null, 2), "utf-8");
 
     downloaded++;
+    allResults.push(...body);
     log(`Downloaded ${body.length} results (${valid} valid) for ${id}`);
   }
-  return downloaded;
+  return { downloaded, allResults };
 }
 
 // ── Daily session ─────────────────────────────────────────────────────────
@@ -383,6 +485,11 @@ async function runSession() {
 
   const state = loadState();
   const basePool = loadKeywords();
+  const stats = loadStats();
+  const knownUsernames = loadKnownUsernames();
+
+  if (!stats.firstRun) stats.firstRun = new Date().toISOString();
+  stats.sessions += 1;
 
   log("=== Starting daily search session (admin API) ===");
   await tgSend("🚀 Datagram: старт дневной сессии поиска");
@@ -467,8 +574,41 @@ async function runSession() {
 
         // Wait for completion, then download
         const finished = await waitForCompletion(ids);
-        const downloaded = await downloadResults(ids);
+        const { downloaded, allResults } = await downloadResults(ids);
         log(`Batch #${batches}: ${finished} finished, ${downloaded} downloaded`);
+
+        // Persist valid channels to the cumulative JSONL (dedup by username)
+        const validItems = allResults.filter((c) => c && c.IsValid === true);
+        const newValid = appendValidChannels(validItems, knownUsernames);
+
+        // Accumulate stats and report this batch
+        const batchCounts = accumulateStats(stats, allResults);
+        stats.totalJobs += ids.length;
+        stats.lastRun = new Date().toISOString();
+        stats.batches.push({
+          batch: batches,
+          date: new Date().toISOString(),
+          keywords: batch.slice(),
+          jobs: ids.length,
+          newValidChannels: newValid,
+          ...batchCounts,
+        });
+        if (stats.batches.length > 2000) stats.batches = stats.batches.slice(-2000);
+        saveStats(stats);
+
+        await tgSend(
+          `📊 Datagram: батч #${batches} завершён\n` +
+            `• Задач: ${ids.length}\n` +
+            `• Найдено: ${batchCounts.results}\n` +
+            `• Валидных: ${batchCounts.valid}\n` +
+            `• Каналов: ${batchCounts.channels}\n` +
+            `• Чатов: ${batchCounts.chats}\n\n` +
+            `Всего за всё время:\n` +
+            `• Валидных: ${stats.totalValid}\n` +
+            `• Каналов: ${stats.totalChannels}\n` +
+            `• Чатов: ${stats.totalChats}\n` +
+            `• Уникальных: ${stats.totalUniqueUsernames}`
+        );
       }
 
       if (failed) {
@@ -486,9 +626,19 @@ async function runSession() {
     await tgSend(`❌ Datagram: ошибка сессии: ${err.message}`);
   } finally {
     saveState(state);
+    saveStats(stats);
     sessionRunning = false;
     log(`=== Session finished: ${batches} batches, ${totalJobs} jobs ===`);
-    await tgSend(`✅ Datagram: сессия завершена — ${batches} батчей, ${totalJobs} задач`);
+    await tgSend(
+      `✅ Datagram: сессия завершена — ${batches} батчей, ${totalJobs} задач\n\n` +
+        `📈 Итог за всё время:\n` +
+        `• Задач: ${stats.totalJobs}\n` +
+        `• Найдено: ${stats.totalResults}\n` +
+        `• Валидных: ${stats.totalValid}\n` +
+        `• Каналов: ${stats.totalChannels}\n` +
+        `• Чатов: ${stats.totalChats}\n` +
+        `• Уникальных: ${stats.totalUniqueUsernames}`
+    );
   }
 }
 

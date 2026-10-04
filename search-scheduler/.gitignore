@@ -4,7 +4,11 @@ config.local.json
 
 # Runtime state
 state.json
+stats.json
 results/
+valid_channels.csv
+valid_channels.json
+valid-channels.jsonl
 
 # Node
 node_modules/

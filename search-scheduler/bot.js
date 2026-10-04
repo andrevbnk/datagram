@@ -37,6 +37,8 @@ const config = JSON.parse(
 
 const RESULTS_DIR = path.join(__dirname, config.resultsDir);
 const STATE_FILE = path.join(__dirname, config.stateFile);
+const STATS_FILE = path.join(__dirname, "stats.json");
+const VALID_CHANNELS_FILE = path.join(__dirname, config.validChannelsFile || "./valid-channels.jsonl");
 const PUBLIC_BASE = config.apiBaseUrl.replace(/\/+$/, "");
 
 const TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || config.telegramBotToken || "";
@@ -104,43 +106,53 @@ function loadState() {
   return defaults;
 }
 
-function scanResults() {
-  let files = 0;
-  let totalItems = 0;
-  let validItems = 0;
-  let channels = 0;
-  let groups = 0;
-  const subscribers = { count: 0, sum: 0 };
-
-  if (!fs.existsSync(RESULTS_DIR)) {
-    return { files, totalItems, validItems, channels, groups, subscribers };
-  }
-
-  for (const f of fs.readdirSync(RESULTS_DIR)) {
-    if (!f.endsWith(".json")) continue;
-    files++;
+function loadStats() {
+  const defaults = {
+    totalJobs: 0,
+    totalResults: 0,
+    totalValid: 0,
+    totalChannels: 0,
+    totalChats: 0,
+    totalUniqueUsernames: 0,
+    uniqueUsernames: [],
+    sessions: 0,
+    batches: [],
+    firstRun: null,
+    lastRun: null,
+  };
+  if (fs.existsSync(STATS_FILE)) {
     try {
-      const items = JSON.parse(
-        fs.readFileSync(path.join(RESULTS_DIR, f), "utf-8")
-      );
-      if (!Array.isArray(items)) continue;
-      for (const it of items) {
-        totalItems++;
-        if (it.IsValid === true) validItems++;
-        const rt = (it.ResourceType || "").toLowerCase();
-        if (rt === "channel") channels++;
-        else if (rt === "group" || rt === "chat") groups++;
-        const sc = Number(it.SubscriberCount);
-        if (Number.isFinite(sc) && sc > 0) {
-          subscribers.count++;
-          subscribers.sum += sc;
-        }
-      }
+      return { ...defaults, ...JSON.parse(fs.readFileSync(STATS_FILE, "utf-8")) };
     } catch {
-      // skip unreadable
+      return defaults;
     }
   }
-  return { files, totalItems, validItems, channels, groups, subscribers };
+  return defaults;
+}
+
+// Count unique valid channels in the JSONL store (dedup by username).
+function scanValidChannels() {
+  let total = 0;
+  const subscribers = { count: 0, sum: 0 };
+  if (!fs.existsSync(VALID_CHANNELS_FILE)) {
+    return { total, subscribers };
+  }
+  const text = fs.readFileSync(VALID_CHANNELS_FILE, "utf-8");
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const rec = JSON.parse(line);
+      total++;
+      const sc = Number(rec.SubscriberCount);
+      if (Number.isFinite(sc) && sc > 0) {
+        subscribers.count++;
+        subscribers.sum += sc;
+      }
+    } catch {
+      // skip malformed
+    }
+  }
+  return { total, subscribers };
 }
 
 async function getBudget() {
@@ -163,7 +175,8 @@ function fmt(n) {
 
 async function buildStatsText() {
   const state = loadState();
-  const r = scanResults();
+  const stats = loadStats();
+  const valid = scanValidChannels();
   const budget = await getBudget();
 
   const lines = [];
@@ -174,26 +187,26 @@ async function buildStatsText() {
       `💰 Токены: <b>${fmt(budget.remaining)}</b> / ${fmt(budget.limit)} (использовано ${fmt(budget.used_today)})`
     );
   }
-  lines.push(`🛠 Задач создано: <b>${fmt(state.tasks.length)}</b>`);
+  lines.push(`🛠 Задач создано: <b>${fmt(stats.totalJobs)}</b>`);
   lines.push(`🔑 Ключей использовано: <b>${fmt(state.usedKeywords.length)}</b>`);
   lines.push(`📍 Курсор пула: <b>${fmt(state.cursor)}</b>`);
-  lines.push(`✅ Батчей (сессий): <b>${fmt(state.completed)}</b>`);
+  lines.push(`✅ Сессий: <b>${fmt(stats.sessions)}</b>`);
   lines.push("");
-  lines.push(`📁 Файлов результатов: <b>${fmt(r.files)}</b>`);
-  lines.push(`👥 Всего записей: <b>${fmt(r.totalItems)}</b>`);
-  lines.push(`✔️ Валидных: <b>${fmt(r.validItems)}</b>`);
+  lines.push(`📁 Всего записей (за всё время): <b>${fmt(stats.totalResults)}</b>`);
+  lines.push(`✔️ Валидных (за всё время): <b>${fmt(stats.totalValid)}</b>`);
   lines.push(
-    `📺 Каналы: <b>${fmt(r.channels)}</b> · 👥 Группы/чаты: <b>${fmt(r.groups)}</b>`
+    `📺 Каналов: <b>${fmt(stats.totalChannels)}</b> · 👥 Чатов: <b>${fmt(stats.totalChats)}</b>`
   );
-  if (r.subscribers.count > 0) {
-    const avg = Math.round(r.subscribers.sum / r.subscribers.count);
+  lines.push(`⭐ Уникальных валидных каналов: <b>${fmt(valid.total)}</b>`);
+  if (valid.subscribers.count > 0) {
+    const avg = Math.round(valid.subscribers.sum / valid.subscribers.count);
     lines.push(
-      `📈 Подписчики: среднее <b>${fmt(avg)}</b> (по ${fmt(r.subscribers.count)} каналам)`
+      `📈 Подписчики: среднее <b>${fmt(avg)}</b> (по ${fmt(valid.subscribers.count)} каналам)`
     );
   }
-  if (state.lastRun) {
+  if (stats.lastRun) {
     lines.push("");
-    lines.push(`🕐 Последний запуск: ${state.lastRun}`);
+    lines.push(`🕐 Последний запуск: ${stats.lastRun}`);
   }
   return lines.join("\n");
 }

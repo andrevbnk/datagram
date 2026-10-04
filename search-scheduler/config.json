@@ -4,6 +4,7 @@
   "keywordsFile": "./keywords.json",
   "stateFile": "./state.json",
   "resultsDir": "./results",
+  "validChannelsFile": "./valid-channels.jsonl",
   "batchSize": 10,
   "limitPerTask": 500,
   "runHour": 13,

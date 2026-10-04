@@ -12,6 +12,8 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     volumes:
       - ./state.json:/app/state.json
+      - ./stats.json:/app/stats.json
+      - ./valid-channels.jsonl:/app/valid-channels.jsonl
       - ./results:/app/results
 
   bot:
@@ -26,4 +28,5 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     volumes:
       - ./state.json:/app/state.json
+      - ./valid-channels.jsonl:/app/valid-channels.jsonl
       - ./results:/app/results
